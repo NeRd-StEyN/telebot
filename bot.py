@@ -17,6 +17,7 @@ import openpyxl
 from google import genai
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.constants import ParseMode
 
 # ── CONFIG ────────────────────────────────────────────────────────────────
 from dotenv import load_dotenv
@@ -25,7 +26,7 @@ load_dotenv()  # Loads variables from .env file if it exists
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 EXCEL_FILE_PATH = os.environ.get("EXCEL_FILE_PATH", "naxcuure(3).xlsx")
-GEMINI_MODEL = "gemini-1.5-flash"  # Switched to 1.5 to avoid high demand on 2.5
+GEMINI_MODEL = "gemini-2.5-flash"  # Reverted to 2.5 because 1.5 returned 404 for this API key
 
 if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN or GEMINI_API_KEY in environment variables.")
@@ -84,13 +85,22 @@ SPREADSHEET DATA:
 
 import time
 
-def ask_gemini(question: str) -> str:
+# ── MEMORY ────────────────────────────────────────────────────────────────
+user_histories = {}
+
+def ask_gemini(question: str, user_id: int) -> str:
+    history = user_histories.get(user_id, [])
+    history_text = "\n".join([f"User: {q}\nAI: {a}" for q, a in history])
+    
     # 1. Quick Relevance Check (Super Fast - No Excel Data Sent)
     try:
         check_prompt = (
             "Does the following message likely require checking a company's production/manufacturing spreadsheet "
-            "to answer? Answer ONLY 'YES' or 'NO'. Message: " + question
+            "to answer? Answer ONLY 'YES' or 'NO'.\n"
         )
+        if history_text:
+            check_prompt += f"Previous context:\n{history_text}\n\n"
+        check_prompt += f"Current Message: {question}"
         check_response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=check_prompt,
@@ -102,9 +112,13 @@ def ask_gemini(question: str) -> str:
     if not needs_data:
         # 2. Fast Answer for casual chat or unrelated questions (Instant response)
         try:
+            fast_context = f"You are a helpful assistant. Please respond to the user."
+            if history_text:
+                fast_context += f"\n\nPrevious conversation:\n{history_text}"
+            fast_context += f"\n\nUser: {question}"
             fast_resp = gemini_client.models.generate_content(
                 model=GEMINI_MODEL,
-                contents=f"You are a helpful assistant. Please respond to the user: {question}"
+                contents=fast_context
             )
             return fast_resp.text
         except Exception as e:
@@ -112,7 +126,8 @@ def ask_gemini(question: str) -> str:
             return "Sorry, I hit an error. Please try again."
 
     # 3. Heavy Data Answer (Send the giant Excel file for data questions)
-    prompt = SYSTEM_PROMPT.format(data=EXCEL_TEXT_DATA) + f"\n\nQUESTION: {question}\n\nANSWER:"
+    q_context = f"Previous conversation:\n{history_text}\n\nCURRENT QUESTION: {question}" if history_text else f"QUESTION: {question}"
+    prompt = SYSTEM_PROMPT.format(data=EXCEL_TEXT_DATA) + f"\n\n{q_context}\n\nANSWER:"
     
     # Try up to 3 times in case of "503 Service Unavailable" (High Demand)
     for attempt in range(3):
@@ -152,10 +167,24 @@ async def reload_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
     question = update.message.text
     await update.message.chat.send_action("typing")
-    answer = ask_gemini(question)
-    await update.message.reply_text(answer)
+    
+    answer = ask_gemini(question, user_id)
+    
+    # Save memory
+    if user_id not in user_histories:
+        user_histories[user_id] = []
+    user_histories[user_id].append((question, answer))
+    if len(user_histories[user_id]) > 4:  # Keep last 4 interactions
+        user_histories[user_id].pop(0)
+
+    try:
+        await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        # Fallback if markdown parsing fails due to unmatched tags
+        await update.message.reply_text(answer)
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────
