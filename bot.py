@@ -106,7 +106,9 @@ def ask_gemini(question: str, user_id: int) -> str:
             contents=check_prompt,
         )
         needs_data = "YES" in check_response.text.strip().upper()
-    except Exception:
+    except Exception as e:
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+            return "⏳ **Whoa, slow down!** You hit Google's free-tier speed limit (15 requests per minute). Please wait 60 seconds!"
         needs_data = True  # If the check fails, default to sending the data just in case
         
     if not needs_data:
@@ -123,6 +125,8 @@ def ask_gemini(question: str, user_id: int) -> str:
             return fast_resp.text
         except Exception as e:
             logger.error(f"Gemini fast error: {e}")
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                return "⏳ **Whoa, slow down!** You hit Google's free-tier speed limit (15 requests per minute). Please wait 60 seconds!"
             return "Sorry, I hit an error. Please try again."
 
     # 3. Heavy Data Answer (Send the giant Excel file for data questions)
@@ -139,6 +143,8 @@ def ask_gemini(question: str, user_id: int) -> str:
             return response.text
         except Exception as e:
             logger.error(f"Gemini error (Attempt {attempt + 1}): {e}")
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                return "⏳ **Whoa, slow down!** You hit Google's free-tier speed limit (15 requests per minute). Please wait 60 seconds!"
             if attempt < 2:
                 time.sleep(3)  # Wait 3 seconds before retrying
             else:
