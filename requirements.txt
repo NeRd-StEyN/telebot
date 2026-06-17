@@ -1,5 +1,5 @@
 openpyxl
-google-genai
+openai
 python-telegram-bot
 flask
 gunicorn
