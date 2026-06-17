@@ -82,17 +82,25 @@ SPREADSHEET DATA:
 """
 
 
+import time
+
 def ask_gemini(question: str) -> str:
     prompt = SYSTEM_PROMPT.format(data=EXCEL_TEXT_DATA) + f"\n\nQUESTION: {question}\n\nANSWER:"
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        return response.text
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        return "Sorry, I hit an error trying to answer that. Please try again in a moment."
+    
+    # Try up to 3 times in case of "503 Service Unavailable" (High Demand)
+    for attempt in range(3):
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            return response.text
+        except Exception as e:
+            logger.error(f"Gemini error (Attempt {attempt + 1}): {e}")
+            if attempt < 2:
+                time.sleep(3)  # Wait 3 seconds before retrying
+            else:
+                return "Sorry, the AI model is currently experiencing high demand and is busy. Please try again in a few seconds!"
 
 
 # ── TELEGRAM HANDLERS ────────────────────────────────────────────────────
