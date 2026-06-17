@@ -153,8 +153,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "- How many batches were COMPLETED in April?\n"
         "- What's the total variance for BOLNOL TABLET?\n"
         "- Which entries have status RUNNING?\n\n"
-        "Type /reload to refresh data if the Excel file was updated."
+        "Commands:\n"
+        "/clear - Wipe my short-term memory to start a new topic\n"
+        "/reload - Refresh data if the Excel file was updated"
     )
+
+
+async def clear_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id in user_histories:
+        user_histories[user_id] = []
+    await update.message.reply_text("🧠 Memory cleared! We are starting a fresh conversation.")
 
 
 async def reload_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -205,6 +214,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reload", reload_data))
+    app.add_handler(CommandHandler("clear", clear_memory))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot starting...")
