@@ -1,0 +1,6 @@
+openpyxl
+google-genai
+python-telegram-bot
+flask
+gunicorn
+python-dotenv
