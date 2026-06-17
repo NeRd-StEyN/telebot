@@ -25,7 +25,7 @@ load_dotenv()  # Loads variables from .env file if it exists
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 EXCEL_FILE_PATH = os.environ.get("EXCEL_FILE_PATH", "naxcuure(3).xlsx")
-GEMINI_MODEL = "gemini-2.5-flash"  # good free-tier balance of quality + quota
+GEMINI_MODEL = "gemini-1.5-flash"  # Switched to 1.5 to avoid high demand on 2.5
 
 if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN or GEMINI_API_KEY in environment variables.")
