@@ -1,3 +1,4 @@
+pandas
 openpyxl
 google-genai
 python-telegram-bot
