@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-from google import genai
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -39,13 +39,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 EXCEL_FILE_PATH = os.environ.get("EXCEL_FILE_PATH", "naxcuure(3).xlsx")
-GEMINI_MODEL = "gemini-2.5-flash"
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
 
-if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
+if not TELEGRAM_BOT_TOKEN or not OPENROUTER_API_KEY:
     raise ValueError(
-        "Missing TELEGRAM_BOT_TOKEN or GEMINI_API_KEY in environment variables."
+        "Missing TELEGRAM_BOT_TOKEN or OPENROUTER_API_KEY in environment variables."
     )
 
 # ── LOGGING ───────────────────────────────────────────────────────────────
@@ -297,8 +297,11 @@ class UserRateLimiter:
         return max(0, int(wait.total_seconds()) + 1)
 
 
-# ── GEMINI SETUP ─────────────────────────────────────────────────────────
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# ── OPENROUTER SETUP ─────────────────────────────────────────────────────────
+llm_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
 # Load data once at startup
 DATAFRAMES = load_data(EXCEL_FILE_PATH)
@@ -485,20 +488,20 @@ RULES:
 """
 
 
-def call_gemini(prompt: str, max_retries: int = 3, retry_wait: int = 60) -> str | None:
-    """Call Gemini with auto-retry on rate-limit (429) errors."""
+def call_llm(prompt: str, max_retries: int = 3, retry_wait: int = 60) -> str | None:
+    """Call OpenRouter LLM with auto-retry on rate-limit (429) errors."""
     for attempt in range(max_retries):
         try:
-            response = gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
+            response = llm_client.chat.completions.create(
+                model=OPENROUTER_MODEL,
+                messages=[{"role": "user", "content": prompt}],
             )
-            return response.text
+            return response.choices[0].message.content
         except Exception as e:
             error_str = str(e)
-            logger.error(f"Gemini error (attempt {attempt + 1}): {error_str}")
+            logger.error(f"LLM error (attempt {attempt + 1}): {error_str}")
 
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+            if "429" in error_str or "rate limit" in error_str.lower() or "quota" in error_str.lower():
                 if attempt < max_retries - 1:
                     logger.info(f"Rate limited — waiting {retry_wait}s before retry...")
                     time.sleep(retry_wait)
@@ -524,7 +527,7 @@ def extract_code(raw_response: str) -> str:
 
 
 # ── MAIN QUESTION PIPELINE ───────────────────────────────────────────────
-def ask_gemini(question: str, user_id: int) -> str:
+def ask_llm(question: str, user_id: int) -> str:
     """Full pipeline: cache check → code gen → safe exec → format answer."""
 
     # 1. Check cache
@@ -549,7 +552,7 @@ def ask_gemini(question: str, user_id: int) -> str:
         code_prompt += f"\n\nPrevious conversation:\n{history_text}"
     code_prompt += f"\n\nUSER QUESTION: {corrected_question}\n\nPYTHON CODE:"
 
-    raw_code = call_gemini(code_prompt)
+    raw_code = call_llm(code_prompt)
     if raw_code is None:
         return (
             "The AI model's rate limit was reached. Please wait about a "
@@ -575,7 +578,7 @@ def ask_gemini(question: str, user_id: int) -> str:
             + f"\n\nThe previous code failed with: {result}\n"
             "Please fix the code and try again. Return ONLY the corrected Python code."
         )
-        raw_code_2 = call_gemini(retry_prompt)
+        raw_code_2 = call_llm(retry_prompt)
         if raw_code_2:
             code_2 = extract_code(raw_code_2)
             logger.info(f"Retry code:\n{code_2}")
@@ -594,7 +597,7 @@ def ask_gemini(question: str, user_id: int) -> str:
         + "\n\nPlease write a clear, helpful answer:"
     )
 
-    formatted = call_gemini(format_prompt)
+    formatted = call_llm(format_prompt)
     if formatted is None:
         # If formatting call fails, return the raw result — still useful
         formatted = f"Here's what I found:\n\n{result}"
@@ -620,7 +623,7 @@ def _fallback_answer(question: str, user_id: int) -> str:
         f"ANSWER (plain text, no markdown):"
     )
 
-    answer = call_gemini(fallback_prompt)
+    answer = call_llm(fallback_prompt)
     if answer:
         return answer
     return (
@@ -704,7 +707,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.chat.send_action("typing")
 
-    answer = ask_gemini(question, user_id)
+    answer = ask_llm(question, user_id)
 
     # Save to conversation history (skip error messages)
     if not answer.startswith(("The AI model's rate limit", "Sorry, I couldn't")):
