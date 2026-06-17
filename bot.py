@@ -180,11 +180,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(user_histories[user_id]) > 4:  # Keep last 4 interactions
         user_histories[user_id].pop(0)
 
+    # Telegram has a strict 4096 character limit per message.
+    # If the AI writes a massive essay, we must split it into chunks to prevent crashes!
     try:
-        await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
+        if len(answer) > 4000:
+            for i in range(0, len(answer), 4000):
+                await update.message.reply_text(answer[i:i+4000], parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(answer, parse_mode=ParseMode.MARKDOWN)
     except Exception:
         # Fallback if markdown parsing fails due to unmatched tags
-        await update.message.reply_text(answer)
+        if len(answer) > 4000:
+            for i in range(0, len(answer), 4000):
+                await update.message.reply_text(answer[i:i+4000])
+        else:
+            await update.message.reply_text(answer)
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────
