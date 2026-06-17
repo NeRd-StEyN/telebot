@@ -85,6 +85,33 @@ SPREADSHEET DATA:
 import time
 
 def ask_gemini(question: str) -> str:
+    # 1. Quick Relevance Check (Super Fast - No Excel Data Sent)
+    try:
+        check_prompt = (
+            "Does the following message likely require checking a company's production/manufacturing spreadsheet "
+            "to answer? Answer ONLY 'YES' or 'NO'. Message: " + question
+        )
+        check_response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=check_prompt,
+        )
+        needs_data = "YES" in check_response.text.strip().upper()
+    except Exception:
+        needs_data = True  # If the check fails, default to sending the data just in case
+        
+    if not needs_data:
+        # 2. Fast Answer for casual chat or unrelated questions (Instant response)
+        try:
+            fast_resp = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=f"You are a helpful assistant. Please respond to the user: {question}"
+            )
+            return fast_resp.text
+        except Exception as e:
+            logger.error(f"Gemini fast error: {e}")
+            return "Sorry, I hit an error. Please try again."
+
+    # 3. Heavy Data Answer (Send the giant Excel file for data questions)
     prompt = SYSTEM_PROMPT.format(data=EXCEL_TEXT_DATA) + f"\n\nQUESTION: {question}\n\nANSWER:"
     
     # Try up to 3 times in case of "503 Service Unavailable" (High Demand)
