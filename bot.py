@@ -362,6 +362,12 @@ def _build_known_values(dataframes: dict[str, pd.DataFrame]) -> set[str]:
                         val_str = str(val).strip()
                         if len(val_str) >= 3:  # skip very short values
                             values.add(val_str)
+                            # Add individual words for better single-word fuzzy matching
+                            # e.g., "BOLNOL TABLET" -> "BOLNOL", "TABLET"
+                            for word in val_str.split():
+                                clean_word = ''.join(c for c in word if c.isalnum())
+                                if len(clean_word) >= 4:
+                                    values.add(clean_word)
     return values
 
 
