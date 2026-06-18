@@ -488,13 +488,14 @@ RULES:
 """
 
 
-def call_llm(prompt: str, max_retries: int = 3, retry_wait: int = 60) -> str | None:
+def call_llm(prompt: str, max_retries: int = 3, retry_wait: int = 60, max_tokens: int = 2048) -> str | None:
     """Call OpenRouter LLM with auto-retry on rate-limit (429) errors."""
     for attempt in range(max_retries):
         try:
             response = llm_client.chat.completions.create(
                 model=OPENROUTER_MODEL,
                 messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
             )
             return response.choices[0].message.content
         except Exception as e:
