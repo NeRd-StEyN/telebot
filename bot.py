@@ -460,7 +460,6 @@ EXAMPLES OF NOT_RELEVANT QUESTIONS:
 - "What is the market price of these drugs?"
 - "Will production increase next month?"
 - "Tell me a joke"
-- Any greeting like "hi", "hello", "how are you"
 
 CRITICAL — FUZZY & CASE-INSENSITIVE MATCHING:
 The user may type in lowercase, have typos, or use partial names. You MUST:
@@ -528,9 +527,9 @@ SPREADSHEET SCHEMA:
 """
 
 NOT_RELEVANT_REPLY = (
-    "Sorry, I can only answer questions about the production spreadsheet data. "
-    "Please ask something related to the data like batch counts, variance, "
-    "product status, manpower, overtime, etc."
+    "Hmm, that doesn't seem related to the spreadsheet data. "
+    "Try asking about products, batches, status, variance, "
+    "manpower, overtime, countries, or packaging details!"
 )
 
 FORMAT_SYSTEM = """\
@@ -589,9 +588,134 @@ def extract_code(raw_response: str) -> str:
     return raw.strip()
 
 
+# ── GREETING DETECTION ────────────────────────────────────────────────────
+GREETING_WORDS = {
+    "hi", "hello", "hey", "hii", "hiii", "helo", "hola", "yo", "sup",
+    "good morning", "good afternoon", "good evening", "good night",
+    "gm", "morning", "evening", "afternoon",
+    "howdy", "greetings", "namaste", "salam", "salaam",
+    "what's up", "whats up", "wassup", "wazzup",
+    "how are you", "how r u", "how r you",
+}
+
+
+def _is_greeting(text: str) -> bool:
+    """Check if the message is a simple greeting."""
+    cleaned = text.strip().lower().rstrip("!?.")
+    # Direct match
+    if cleaned in GREETING_WORDS:
+        return True
+    # Check if the message starts with a greeting word and is short
+    if len(cleaned.split()) <= 4:
+        for greeting in GREETING_WORDS:
+            if cleaned.startswith(greeting):
+                return True
+    return False
+
+
+GREETING_REPLY = (
+    "Hey there! \U0001F44B I'm your production data assistant.\n\n"
+    "Ask me anything about your spreadsheet — batches, products, "
+    "status, variance, manpower, overtime, countries, and more!\n\n"
+    "Try something like:\n"
+    "\u2022 How many batches are running?\n"
+    "\u2022 What's the total variance for BOLNOL TABLET?\n"
+    "\u2022 Which month had the highest production?\n"
+    "\u2022 Compare BOLNOL vs VRAGGRIPP\n"
+    "\u2022 Why is variance high for a product?"
+)
+
+
+# ── INSIGHT MODE (for why/explain/analyze questions) ─────────────────────
+INSIGHT_KEYWORDS = [
+    "why", "explain", "reason", "analyze", "analyse", "insight",
+    "cause", "because", "how come", "what happened",
+    "suggest", "recommend", "improve", "reduce",
+    "tell me about", "summarize", "summary", "overview",
+    "describe", "elaborate",
+]
+
+
+def _is_insight_question(text: str) -> bool:
+    """Check if the question needs analytical reasoning rather than code."""
+    lower = text.strip().lower()
+    return any(kw in lower for kw in INSIGHT_KEYWORDS)
+
+
+def _insight_answer(question: str, dataframes: dict) -> str:
+    """Answer insight/why questions by sending a data summary to the LLM.
+    Uses 1 API call (cheaper than the 2-call code pipeline)."""
+    main_sheet = list(dataframes.keys())[0]
+    df = dataframes[main_sheet]
+
+    # Build a concise data summary with key stats
+    summary_parts = []
+    summary_parts.append(f"DATA SUMMARY ({len(df)} total rows):")
+    summary_parts.append(f"\nProducts: {df['PRODUCT'].unique().tolist() if 'PRODUCT' in df.columns else 'N/A'}")
+    summary_parts.append(f"Countries: {df['COUNTRY'].unique().tolist() if 'COUNTRY' in df.columns else 'N/A'}")
+    summary_parts.append(f"Months: {df['MONTH'].unique().tolist() if 'MONTH' in df.columns else 'N/A'}")
+    summary_parts.append(f"Statuses: {df['STATUS'].unique().tolist() if 'STATUS' in df.columns else 'N/A'}")
+    summary_parts.append(f"Stages: {df['STAGE'].unique().tolist() if 'STAGE' in df.columns else 'N/A'}")
+
+    # Key aggregations
+    if 'PRODUCT' in df.columns and 'VARIANCE' in df.columns:
+        var_by_product = df.groupby('PRODUCT')['VARIANCE'].agg(['sum', 'mean', 'count'])
+        summary_parts.append(f"\nVARIANCE BY PRODUCT:\n{var_by_product.to_string()}")
+
+    if 'PRODUCT' in df.columns and 'ACTUAL QTY' in df.columns:
+        qty_by_product = df.groupby('PRODUCT')['ACTUAL QTY'].agg(['sum', 'mean'])
+        summary_parts.append(f"\nACTUAL QTY BY PRODUCT:\n{qty_by_product.to_string()}")
+
+    if 'MONTH' in df.columns and 'ACTUAL QTY' in df.columns:
+        qty_by_month = df.groupby('MONTH')['ACTUAL QTY'].agg(['sum', 'count'])
+        summary_parts.append(f"\nPRODUCTION BY MONTH:\n{qty_by_month.to_string()}")
+
+    if 'OVERTIME (HRS)' in df.columns:
+        summary_parts.append(f"\nOVERTIME: avg={df['OVERTIME (HRS)'].mean():.2f}, total={df['OVERTIME (HRS)'].sum():.1f}")
+
+    if 'MANPOWER' in df.columns:
+        summary_parts.append(f"MANPOWER: avg={df['MANPOWER'].mean():.2f}, total={df['MANPOWER'].sum():.1f}")
+
+    # A small sample of relevant rows (filter if question mentions a product)
+    sample_df = df.head(15)
+    for known_val in KNOWN_VALUES:
+        if known_val.lower() in question.lower():
+            filtered = df[df.apply(lambda row: known_val.lower() in str(row.values).lower(), axis=1)]
+            if len(filtered) > 0:
+                sample_df = filtered.head(20)
+                break
+
+    summary_parts.append(f"\nSAMPLE ROWS:\n{sample_df.to_string(index=False)}")
+
+    data_summary = "\n".join(summary_parts)
+
+    prompt = (
+        f"You are a helpful production data analyst. Answer the user's question "
+        f"based ONLY on the data summary below. Be insightful, identify patterns, "
+        f"and give actionable observations.\n\n"
+        f"RULES:\n"
+        f"- Use ONLY the data provided. Do not make up numbers.\n"
+        f"- Do not use markdown formatting (no asterisks, no backticks).\n"
+        f"- Be conversational and clear.\n"
+        f"- If you can't fully answer from this data, say what you can observe.\n\n"
+        f"{data_summary}\n\n"
+        f"USER QUESTION: {question}\n\n"
+        f"ANSWER:"
+    )
+
+    answer = call_llm(prompt, max_tokens=1024)
+    if answer:
+        return answer
+    return "Sorry, I couldn't analyze that right now. Please try again."
+
+
 # ── MAIN QUESTION PIPELINE ───────────────────────────────────────────────
 def ask_llm(question: str, user_id: int) -> str:
-    """Full pipeline: cache check → code gen → safe exec → format answer."""
+    """Full pipeline: greeting check → cache → insight/code gen → answer."""
+
+    # 0. Handle greetings locally (zero API cost)
+    if _is_greeting(question):
+        return GREETING_REPLY
 
     # 1. Check cache
     cached = cache.get(question)
@@ -608,6 +732,13 @@ def ask_llm(question: str, user_id: int) -> str:
     corrected_question, corrections = fuzzy_correct_question(question)
     if corrections:
         logger.info(f"Fuzzy corrections: {corrections}")
+
+    # 3.5. Route insight/why questions to the insight pipeline (1 API call)
+    if _is_insight_question(question):
+        logger.info("Routing to insight mode (why/explain question)")
+        answer = _insight_answer(corrected_question, DATAFRAMES)
+        cache.put(question, answer)
+        return answer
 
     # 4. Generate pandas code
     code_prompt = CODE_GEN_SYSTEM.format(schema=SCHEMA_PROMPT)
@@ -630,7 +761,7 @@ def ask_llm(question: str, user_id: int) -> str:
     if "NOT_RELEVANT" in code.upper().replace(" ", "") and len(code.strip()) < 50:
         return NOT_RELEVANT_REPLY
 
-    # 4. Execute the code safely
+    # 5. Execute the code safely
     success, result = execute_safely(code, DATAFRAMES)
 
     if not success:
@@ -652,7 +783,7 @@ def ask_llm(question: str, user_id: int) -> str:
             # Fallback: send a small data subset as plain text
             return _fallback_answer(question, user_id)
 
-    # 5. Format the raw result into a natural-language answer
+    # 6. Format the raw result into a natural-language answer
     format_prompt = (
         FORMAT_SYSTEM
         + f"\n\nUser asked: {question}"
@@ -665,7 +796,7 @@ def ask_llm(question: str, user_id: int) -> str:
         # If formatting call fails, return the raw result — still useful
         formatted = f"Here's what I found:\n\n{result}"
 
-    # 6. Cache and return
+    # 7. Cache and return
     cache.put(question, formatted)
     return formatted
 
