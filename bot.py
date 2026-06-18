@@ -95,6 +95,18 @@ def load_data(path: str) -> dict[str, pd.DataFrame]:
                             ),
                             errors="coerce",
                         )
+            # Auto-detect date columns: try converting text columns that
+            # look like dates (e.g. "2026-04-28 00:00:00") to datetime.
+            elif df[col].dtype == "object":
+                sample = df[col].dropna().head(10)
+                if len(sample) > 0:
+                    try:
+                        parsed = pd.to_datetime(sample, errors="coerce")
+                        if parsed.notna().sum() / len(sample) > 0.7:
+                            df[col] = pd.to_datetime(df[col], errors="coerce")
+                            logger.info(f"  Converted '{col}' to datetime")
+                    except Exception:
+                        pass
         dataframes[sheet] = df
         logger.info(
             f"Loaded sheet '{sheet}': {len(df)} rows x {len(df.columns)} cols"
@@ -458,6 +470,11 @@ CODE RULES (only if the question IS about the data):
     have?", "list all batches with status HOLD", "what country is product Z \
     for?" — just filter and return the relevant columns as a DataFrame.
   - MIXED questions: "which product has the highest variance?" — compute + text.
+  - TEMPORAL / ORDERING questions: "last batch", "latest entry", "most recent", \
+    "first batch", "oldest" — sort by the DATE column (it is datetime type) \
+    and use .iloc[-1] for last or .iloc[0] for first. Example:
+    last_row = df.sort_values('DATE').iloc[-1]
+    result = f"Last batch: {last_row['BATCH NO']} — Status: {last_row['STATUS']}"
 - If the question asks for a count, total, average, etc., `result` should be \
   a number or a simple string.
 - If the question asks for a list, details, or table, `result` should be a DataFrame.
