@@ -739,8 +739,19 @@ def main():
     app.add_handler(CommandHandler("schema", show_schema))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Register an error handler to suppress transient Conflict errors during
+    # Render redeploys (old + new instance briefly overlap).
+    async def error_handler(update, context):
+        import telegram.error
+        if isinstance(context.error, telegram.error.Conflict):
+            logger.warning("Conflict error (another instance running) — will resolve shortly.")
+            return  # suppress; the old instance will die soon
+        logger.error(f"Unhandled exception: {context.error}")
+
+    app.add_error_handler(error_handler)
+
     logger.info("Bot starting (Text-to-Pandas architecture)...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
