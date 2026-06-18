@@ -75,6 +75,7 @@ def load_data(path: str) -> dict[str, pd.DataFrame]:
                 )
                 # Try converting comma-separated number strings to float
                 sample = df[col].dropna().head(20)
+                converted = False
                 if len(sample) > 0:
                     numeric_count = 0
                     for val in sample:
@@ -95,18 +96,29 @@ def load_data(path: str) -> dict[str, pd.DataFrame]:
                             ),
                             errors="coerce",
                         )
-            # Auto-detect date columns: try converting text columns that
-            # look like dates (e.g. "2026-04-28 00:00:00") to datetime.
-            elif df[col].dtype == "object":
-                sample = df[col].dropna().head(10)
-                if len(sample) > 0:
-                    try:
-                        parsed = pd.to_datetime(sample, errors="coerce")
-                        if parsed.notna().sum() / len(sample) > 0.7:
-                            df[col] = pd.to_datetime(df[col], errors="coerce")
-                            logger.info(f"  Converted '{col}' to datetime")
-                    except Exception:
-                        pass
+                        converted = True
+
+                # Auto-detect date columns (only if not already converted to numeric)
+                if not converted and df[col].dtype == "object":
+                    date_sample = df[col].dropna().head(10)
+                    if len(date_sample) > 0:
+                        try:
+                            parsed = pd.to_datetime(date_sample, errors="coerce")
+                            if parsed.notna().sum() / len(date_sample) > 0.7:
+                                df[col] = pd.to_datetime(df[col], errors="coerce")
+                                logger.info(f"  Converted '{col}' to datetime")
+                                converted = True
+                        except Exception:
+                            pass
+
+                # Normalize categorical string columns to UPPERCASE
+                # (fixes inconsistencies like 'COMPLETED' vs 'completed')
+                if not converted and df[col].dtype == "object":
+                    nunique = df[col].nunique()
+                    if nunique <= 20:  # categorical-like columns only
+                        df[col] = df[col].apply(
+                            lambda x: x.upper() if isinstance(x, str) else x
+                        )
         dataframes[sheet] = df
         logger.info(
             f"Loaded sheet '{sheet}': {len(df)} rows x {len(df.columns)} cols"
@@ -131,7 +143,7 @@ def get_schema_prompt(dataframes: dict[str, pd.DataFrame]) -> str:
 
             # For columns with few unique values, list them all (helps the LLM
             # generate correct filters without seeing the raw data).
-            if nunique <= 15 and dtype == "object":
+            if nunique <= 25 and dtype == "object":
                 unique_vals = df[col].dropna().unique().tolist()
                 info += f" — values: {unique_vals}"
             elif dtype in ("float64", "int64"):
@@ -217,7 +229,13 @@ def execute_safely(
             return False, f"Blocked unsafe pattern in generated code: {pattern}"
 
     # Build the sandbox namespace
-    namespace = {"__builtins__": SAFE_BUILTINS, "pd": pd, "np": np}
+    namespace = {
+        "__builtins__": SAFE_BUILTINS,
+        "pd": pd,
+        "np": np,
+        "datetime": datetime,
+        "timedelta": timedelta,
+    }
 
     # Make all sheets available — main sheet as `df`, others by clean name
     sheet_names = list(dataframes.keys())
@@ -460,7 +478,12 @@ The user may type in lowercase, have typos, or use partial names. You MUST:
 
 CODE RULES (only if the question IS about the data):
 - Store the final answer in a variable called `result`.
-- Available variables: `df` (main sheet DataFrame), `pd` (pandas), `np` (numpy).
+- Available variables:
+  - `df` (main ENTRY sheet DataFrame — production data)
+  - `master_packing` (MASTER PACKING sheet — packaging specs)
+  - `pd` (pandas), `np` (numpy)
+  - `datetime`, `timedelta` (for date calculations)
+  - All sheets are also available by their clean lowercase name (spaces → underscores).
 - Do NOT use import statements. Do NOT use open(), os, sys, or any I/O.
 - Do NOT use exec() or eval().
 - Handle potential errors (e.g., missing columns) gracefully.
@@ -472,9 +495,27 @@ CODE RULES (only if the question IS about the data):
   - MIXED questions: "which product has the highest variance?" — compute + text.
   - TEMPORAL / ORDERING questions: "last batch", "latest entry", "most recent", \
     "first batch", "oldest" — sort by the DATE column (it is datetime type) \
-    and use .iloc[-1] for last or .iloc[0] for first. Example:
+    and use .iloc[-1] for last or .iloc[0] for first. For date-relative queries \
+    like "last 7 days", use: df[df['DATE'] >= df['DATE'].max() - timedelta(days=7)]. \
+    Example for "last batch":
     last_row = df.sort_values('DATE').iloc[-1]
-    result = f"Last batch: {last_row['BATCH NO']} — Status: {last_row['STATUS']}"
+    result = f"Last batch: {{last_row['BATCH NO']}} — Status: {{last_row['STATUS']}}"
+  - COMPARISON questions: "compare X vs Y" — group by the relevant column \
+    and aggregate. Example:
+    result = df[df['PRODUCT'].str.contains('BOLNOL|VRAGGRIPP', case=False, na=False)] \
+      .groupby('PRODUCT').agg({{'ACTUAL QTY': 'sum', 'VARIANCE': 'sum'}})
+  - PERCENTAGE questions: "what % of batches are completed?" — compute count \
+    of matching rows divided by total, multiply by 100. Example:
+    total = len(df)
+    completed = len(df[df['STATUS'].str.contains('COMPLETED', case=False, na=False)])
+    result = f"{{completed}} out of {{total}} batches are completed ({{completed/total*100:.1f}}%)"
+  - TREND / PER-MONTH questions: "which month had highest production?" — \
+    group by MONTH column. Example:
+    result = df.groupby('MONTH')['ACTUAL QTY'].sum().sort_values(ascending=False)
+  - TOP-N questions: "top 5 products by variance" — sort and head. Example:
+    result = df.groupby('PRODUCT')['VARIANCE'].sum().sort_values(ascending=False).head(5)
+  - PACKING / PACKAGING questions: use the `master_packing` DataFrame. Example:
+    result = master_packing[master_packing['PRODUCT NAME'].str.contains('BOLNOL', case=False, na=False)]
 - If the question asks for a count, total, average, etc., `result` should be \
   a number or a simple string.
 - If the question asks for a list, details, or table, `result` should be a DataFrame.
@@ -525,6 +566,10 @@ def call_llm(prompt: str, max_retries: int = 3, retry_wait: int = 60, max_tokens
                     time.sleep(retry_wait)
                     continue
                 return None  # Exhausted retries
+            # 402 = out of credits — no point retrying
+            if "402" in error_str or "Payment Required" in error_str:
+                logger.error("Out of OpenRouter credits — failing immediately.")
+                return None
             if attempt < max_retries - 1:
                 time.sleep(3)
             else:
