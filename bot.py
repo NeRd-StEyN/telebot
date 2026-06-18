@@ -39,13 +39,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 EXCEL_FILE_PATH = os.environ.get("EXCEL_FILE_PATH", "naxcuure(3).xlsx")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-if not TELEGRAM_BOT_TOKEN or not OPENROUTER_API_KEY:
+if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
     raise ValueError(
-        "Missing TELEGRAM_BOT_TOKEN or OPENROUTER_API_KEY in environment variables."
+        "Missing TELEGRAM_BOT_TOKEN or GROQ_API_KEY in environment variables."
     )
 
 # ── LOGGING ───────────────────────────────────────────────────────────────
@@ -327,10 +327,10 @@ class UserRateLimiter:
         return max(0, int(wait.total_seconds()) + 1)
 
 
-# ── OPENROUTER SETUP ─────────────────────────────────────────────────────────
+# ── GROQ SETUP ───────────────────────────────────────────────────────────────
 llm_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
+    base_url="https://api.groq.com/openai/v1",
+    api_key=GROQ_API_KEY,
 )
 
 # Load data once at startup
@@ -550,7 +550,7 @@ def call_llm(prompt: str, max_retries: int = 3, retry_wait: int = 60, max_tokens
     for attempt in range(max_retries):
         try:
             response = llm_client.chat.completions.create(
-                model=OPENROUTER_MODEL,
+                model=GROQ_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
             )
