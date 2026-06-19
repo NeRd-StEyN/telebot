@@ -266,7 +266,7 @@ def execute_safely(
 
     The code must store its final answer in a variable called `result`.
     Available variables: df (main sheet), all sheet DataFrames by name,
-    pd (pandas), np (numpy).
+    pd (pandas), np (numpy), _sort_by_month (month ordering helper).
     """
     # Security checks
     for pattern in BLOCKED_PATTERNS:
@@ -280,6 +280,7 @@ def execute_safely(
         "np": np,
         "datetime": datetime,
         "timedelta": timedelta,
+        "_sort_by_month": _sort_by_month,  # month ordering helper
     }
 
     # Make all sheets available — main sheet as `df`, others by clean name
@@ -295,6 +296,13 @@ def execute_safely(
         result = namespace.get("result", None)
         if result is None:
             return False, "Code did not set a 'result' variable."
+
+        # Detect empty results — treat as a soft failure so the pipeline
+        # can retry with a looser query
+        if isinstance(result, pd.DataFrame) and len(result) == 0:
+            return False, "Query returned 0 rows — the filter may be too strict."
+        if isinstance(result, pd.Series) and len(result) == 0:
+            return False, "Query returned an empty Series — the filter may be too strict."
 
         # Convert DataFrames/Series to string for the formatting step
         if isinstance(result, (pd.DataFrame, pd.Series)):
@@ -494,6 +502,37 @@ def fuzzy_correct_question(question: str) -> tuple[str, list[str]]:
     return corrected, corrections
 
 
+# ── MONTH ORDERING ────────────────────────────────────────────────────────
+# Chronological order for month groupby results so they display Jan→Dec
+# instead of alphabetically. Add more months as needed.
+MONTH_ORDER = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def _sort_by_month(series_or_df):
+    """Sort a Series/DataFrame whose index or 'MONTH' column is month names
+    in chronological order. Falls back to original order if months are unknown."""
+    if isinstance(series_or_df, pd.Series):
+        idx = series_or_df.index.tolist()
+        ordered = [m for m in MONTH_ORDER if m in idx]
+        remaining = [m for m in idx if m not in MONTH_ORDER]
+        new_order = ordered + remaining
+        return series_or_df.reindex(new_order).dropna()
+    elif isinstance(series_or_df, pd.DataFrame):
+        if "MONTH" in series_or_df.columns:
+            cat = pd.Categorical(
+                series_or_df["MONTH"],
+                categories=MONTH_ORDER,
+                ordered=True,
+            )
+            series_or_df = series_or_df.copy()
+            series_or_df["MONTH"] = cat
+            return series_or_df.sort_values("MONTH")
+    return series_or_df
+
+
 # ── CODE GENERATION PROMPT ────────────────────────────────────────────────
 CODE_GEN_SYSTEM = """\
 You are a strict data analyst assistant. Given a spreadsheet schema and a \
@@ -526,6 +565,20 @@ The user may type in lowercase, have typos, or use partial names. You MUST:
   and use `.str.contains()` with the KEY PART of the name (not the full name \
   if it's long).
 
+IMPORTANT — BATCH COUNT vs ROW COUNT:
+- Each ROW in the data represents ONE STAGE of a batch, NOT one batch.
+- "NO. OF BATCHES" column holds the actual number of batches for that row.
+- For questions like "how many batches", use df['NO. OF BATCHES'].sum() \
+  (or filtered subset), NOT len(df).
+- Use len(df) only when asked for number of entries/records/rows.
+
+IMPORTANT — MONTH ORDERING:
+- When grouping by MONTH, use the `_sort_by_month` helper to sort results \
+  chronologically (April → May → June) instead of alphabetically.
+  Example:
+  monthly = df.groupby('MONTH')['ACTUAL QTY'].sum()
+  result = _sort_by_month(monthly)
+
 CODE RULES (only if the question IS about the data):
 - Store the final answer in a variable called `result`.
 - Available variables:
@@ -533,6 +586,7 @@ CODE RULES (only if the question IS about the data):
   - `master_packing` (MASTER PACKING sheet — packaging specs)
   - `pd` (pandas), `np` (numpy)
   - `datetime`, `timedelta` (for date calculations)
+  - `_sort_by_month` (helper to sort month groupby results chronologically)
   - All sheets are also available by their clean lowercase name (spaces → underscores).
 - Do NOT use import statements. Do NOT use open(), os, sys, or any I/O.
 - Do NOT use exec() or eval().
@@ -554,14 +608,15 @@ CODE RULES (only if the question IS about the data):
     and aggregate. Example:
     result = df[df['PRODUCT'].str.contains('BOLNOL|VRAGGRIPP', case=False, na=False)] \
       .groupby('PRODUCT').agg({{'ACTUAL QTY': 'sum', 'VARIANCE': 'sum'}})
-  - PERCENTAGE questions: "what % of batches are completed?" — compute count \
-    of matching rows divided by total, multiply by 100. Example:
-    total = len(df)
-    completed = len(df[df['STATUS'].str.contains('COMPLETED', case=False, na=False)])
-    result = f"{{completed}} out of {{total}} batches are completed ({{completed/total*100:.1f}}%)"
+  - PERCENTAGE questions: "what % of batches are completed?" — use \
+    NO. OF BATCHES column for batch counts. Example:
+    total = df['NO. OF BATCHES'].sum()
+    completed = df[df['STATUS'].str.contains('COMPLETED', case=False, na=False)]['NO. OF BATCHES'].sum()
+    result = f"{{int(completed)}} out of {{int(total)}} batches completed ({{completed/total*100:.1f}}%)"
   - TREND / PER-MONTH questions: "which month had highest production?" — \
-    group by MONTH column. Example:
-    result = df.groupby('MONTH')['ACTUAL QTY'].sum().sort_values(ascending=False)
+    group by MONTH and sort chronologically. Example:
+    monthly = df.groupby('MONTH')['ACTUAL QTY'].sum()
+    result = _sort_by_month(monthly)
   - TOP-N questions: "top 5 products by variance" — sort and head. Example:
     result = df.groupby('PRODUCT')['VARIANCE'].sum().sort_values(ascending=False).head(5)
   - PACKING / PACKAGING questions: use the `master_packing` DataFrame. Example:
@@ -570,7 +625,8 @@ CODE RULES (only if the question IS about the data):
   a number or a simple string.
 - If the question asks for a list, details, or table, `result` should be a DataFrame.
 - Keep code simple and concise. No plots.
-- Column names are case-sensitive; use them exactly as shown in the schema.
+- Column names are CASE-SENSITIVE. Use the EXACT column names from the schema \
+  below. Do not guess or abbreviate column names.
 - Return ONLY the Python code. No explanations, no markdown fences.
 
 SPREADSHEET SCHEMA:
@@ -585,15 +641,33 @@ NOT_RELEVANT_REPLY = (
 
 FORMAT_SYSTEM = """\
 You are a helpful assistant that takes raw data results and formats them \
-into a clear, concise plain-text answer for the user. \
+into a clear, concise plain-text answer for the user.
 RULES:
 - ONLY use the raw data result provided. Do NOT add any outside knowledge.
 - Do not use markdown formatting like asterisks or backticks.
 - Be conversational and helpful.
-- If the result is a table, present it neatly.
+- If the result is a table, present it neatly with aligned columns.
 - Keep it brief and factual.
-- If the data seems empty or has no results, say so clearly.\
+- If the data seems empty or has no results, say so clearly.
+- When showing month data, present it in chronological order.
+- When showing numbers, round to sensible precision (no unnecessary decimals).\
 """
+
+
+def _question_type_hint(question: str) -> str:
+    """Return a hint about the expected answer format to guide the formatter."""
+    q = question.lower()
+    if any(w in q for w in ["how many", "count", "total", "sum", "average", "avg", "max", "min"]):
+        return "The answer should be a number or brief statistic."
+    if any(w in q for w in ["list", "show", "which", "what are", "display", "give me"]):
+        return "The answer should be a formatted list or table."
+    if any(w in q for w in ["highest", "lowest", "best", "worst", "most", "least", "top", "bottom"]):
+        return "The answer should clearly state the winner/loser and its value."
+    if any(w in q for w in ["compare", "vs", "versus", "difference"]):
+        return "The answer should compare the values side by side."
+    if any(w in q for w in ["month", "trend", "over time", "per month"]):
+        return "Show results per month in chronological order (earliest first)."
+    return ""
 
 
 def call_llm(prompt: str, max_retries: int = 3, retry_wait: int = 60, max_tokens: int = 2048) -> str | None:
@@ -780,8 +854,9 @@ def _insight_answer(question: str, dataframes: dict) -> str:
     if 'MANPOWER' in df.columns:
         summary_parts.append(f"MANPOWER: avg={df['MANPOWER'].mean():.2f}, total={df['MANPOWER'].sum():.1f}")
 
-    # A small sample of relevant rows (filter if question mentions a product)
-    sample_df = df.head(15)
+    # Representative sample rows (filter if question mentions a product,
+    # otherwise use stratified sampling across months/statuses)
+    sample_df = _get_representative_sample(df, n=20)
     for known_val in KNOWN_VALUES:
         if known_val.lower() in question.lower():
             filtered = df[df.apply(lambda row: known_val.lower() in str(row.values).lower(), axis=1)]
@@ -873,28 +948,52 @@ def ask_llm(question: str, user_id: int) -> str:
     success, result = execute_safely(code, DATAFRAMES)
 
     if not success:
-        logger.warning(f"Code execution failed: {result}")
-        # Retry once with the error message fed back
+        logger.warning(f"Code execution failed (attempt 1): {result}")
+        # Retry #1 — feed the error back and ask the LLM to fix it
         retry_prompt = (
             code_prompt
-            + f"\n\nThe previous code failed with: {result}\n"
-            "Please fix the code and try again. Return ONLY the corrected Python code."
+            + f"\n\nThe previous code failed with error: {result}\n"
+            "IMPORTANT: Fix the issue. Common problems:\n"
+            "- Empty results: loosen the filter (use .str.contains instead of ==)\n"
+            "- Wrong column name: use EXACT column names from the schema above\n"
+            "- Type error: check column dtypes in the schema (numeric vs string)\n"
+            "- Use NO. OF BATCHES column for batch counts, not len(df)\n"
+            "Return ONLY the corrected Python code."
         )
         raw_code_2 = call_llm(retry_prompt)
         if raw_code_2:
             code_2 = extract_code(raw_code_2)
-            logger.info(f"Retry code:\n{code_2}")
+            logger.info(f"Retry #1 code:\n{code_2}")
             success, result = execute_safely(code_2, DATAFRAMES)
 
         if not success:
-            logger.warning(f"Retry also failed: {result}")
-            # Fallback: send a small data subset as plain text
+            logger.warning(f"Retry #1 failed (attempt 2): {result}")
+            # Retry #2 — simplify and try a more direct approach
+            retry_prompt_2 = (
+                code_prompt
+                + f"\n\nTwo previous attempts failed. Last error: {result}\n"
+                "Try a SIMPLER approach — avoid complex chaining, use basic "
+                "pandas operations step by step. If filtering returns empty, "
+                "return all data for the relevant column instead.\n"
+                "Return ONLY the corrected Python code."
+            )
+            raw_code_3 = call_llm(retry_prompt_2)
+            if raw_code_3:
+                code_3 = extract_code(raw_code_3)
+                logger.info(f"Retry #2 code:\n{code_3}")
+                success, result = execute_safely(code_3, DATAFRAMES)
+
+        if not success:
+            logger.warning(f"All retries failed: {result}")
+            # Final fallback: send representative data subset as plain text
             return _fallback_answer(question, user_id)
 
     # 6. Format the raw result into a natural-language answer
+    type_hint = _question_type_hint(question)
     format_prompt = (
         FORMAT_SYSTEM
         + f"\n\nUser asked: {question}"
+        + (f"\nAnswer format hint: {type_hint}" if type_hint else "")
         + f"\n\nRaw data result:\n{result}"
         + "\n\nPlease write a clear, helpful answer:"
     )
@@ -950,10 +1049,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Loaded data:\n{sheets_summary}\n\n"
         "Just type a question, e.g.:\n"
         "- How many batches were COMPLETED in April?\n"
+        "- Which month had the highest production?\n"
         "- What's the total variance for BOLNOL TABLET?\n"
         "- Which entries have status RUNNING?\n"
-        "- Average manpower per month?\n\n"
+        "- Average manpower per month?\n"
+        "- Compare BOLNOL vs VRAGGRIPP production\n\n"
         "Commands:\n"
+        "/stats - Quick data overview\n"
         "/clear - Wipe my short-term memory\n"
         "/reload - Refresh data if the Excel file was updated\n"
         "/schema - See what columns are available"
@@ -968,15 +1070,21 @@ async def clear_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reload_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DATAFRAMES, SCHEMA_PROMPT
+    global DATAFRAMES, SCHEMA_PROMPT, KNOWN_VALUES, KNOWN_VALUES_LOWER
     try:
         DATAFRAMES = load_data(EXCEL_FILE_PATH)
         SCHEMA_PROMPT = get_schema_prompt(DATAFRAMES)
+        # Rebuild fuzzy matcher with fresh data values
+        KNOWN_VALUES = _build_known_values(DATAFRAMES)
+        KNOWN_VALUES_LOWER = {v.lower(): v for v in KNOWN_VALUES}
         cache.clear()
         sheets_info = ", ".join(
             f"{name} ({len(df)} rows)" for name, df in DATAFRAMES.items()
         )
-        await update.message.reply_text(f"Data reloaded: {sheets_info}")
+        await update.message.reply_text(
+            f"Data reloaded: {sheets_info}\n"
+            f"Fuzzy matcher updated with {len(KNOWN_VALUES)} known values."
+        )
     except Exception as e:
         await update.message.reply_text(f"Failed to reload: {e}")
 
@@ -994,6 +1102,59 @@ async def show_schema(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Trim if too long for Telegram
     if len(text) > 4000:
         text = text[:4000] + "\n... (truncated)"
+    await update.message.reply_text(text)
+
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show a quick data summary — row counts, date range, products, statuses."""
+    parts = []
+    main_sheet = list(DATAFRAMES.keys())[0]
+    df = DATAFRAMES[main_sheet]
+
+    parts.append(f"Production Data Overview ({len(df)} entries)")
+    parts.append("")
+
+    if "DATE" in df.columns:
+        date_min = df["DATE"].min()
+        date_max = df["DATE"].max()
+        parts.append(f"Date range: {date_min.strftime('%d %b %Y')} to {date_max.strftime('%d %b %Y')}")
+
+    if "MONTH" in df.columns:
+        months = df["MONTH"].dropna().unique().tolist()
+        # Sort chronologically
+        ordered_months = [m for m in MONTH_ORDER if m in months]
+        parts.append(f"Months: {', '.join(ordered_months)}")
+
+    if "NO. OF BATCHES" in df.columns:
+        total_batches = int(df["NO. OF BATCHES"].sum())
+        parts.append(f"Total batches: {total_batches}")
+
+    if "STATUS" in df.columns:
+        parts.append("")
+        parts.append("Status breakdown:")
+        for status, count in df["STATUS"].value_counts().items():
+            parts.append(f"  {status}: {count} entries")
+
+    if "PRODUCT" in df.columns:
+        parts.append("")
+        products = df["PRODUCT"].dropna().unique().tolist()
+        parts.append(f"Products ({len(products)}):")
+        for p in products:
+            parts.append(f"  - {p}")
+
+    if "COUNTRY" in df.columns:
+        countries = df["COUNTRY"].dropna().unique().tolist()
+        parts.append("")
+        parts.append(f"Countries: {', '.join(countries)}")
+
+    if "ACTUAL QTY" in df.columns:
+        parts.append("")
+        parts.append(f"Total actual qty: {df['ACTUAL QTY'].sum():,.0f}")
+        parts.append(f"Total planned qty: {df['PLANNED QTY'].sum():,.0f}" if "PLANNED QTY" in df.columns else "")
+
+    text = "\n".join(p for p in parts if p is not None)
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
     await update.message.reply_text(text)
 
 
@@ -1042,6 +1203,7 @@ def main():
     app.add_handler(CommandHandler("reload", reload_data))
     app.add_handler(CommandHandler("clear", clear_memory))
     app.add_handler(CommandHandler("schema", show_schema))
+    app.add_handler(CommandHandler("stats", show_stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Register an error handler to suppress transient Conflict errors during
