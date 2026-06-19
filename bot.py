@@ -66,28 +66,37 @@ def load_data(path: str) -> dict[str, pd.DataFrame]:
         # Drop fully-empty columns and rows
         df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
         # Auto-clean: convert comma-formatted number strings to actual numbers.
-        # Excel files often store quantities like "1,60,000.00" as text.
+        # Excel files often store quantities like "1,60,000.00" (Indian format)
+        # or "160,000.00" (Western format) as text.
         for col in df.columns:
             if df[col].dtype == "object":
                 # Strip trailing/leading whitespace from all string columns
                 df[col] = df[col].apply(
                     lambda x: x.strip() if isinstance(x, str) else x
                 )
-                # Try converting comma-separated number strings to float
-                sample = df[col].dropna().head(20)
+                # Try converting comma-separated number strings to float.
+                # Sample MORE rows (up to 50) for better accuracy.
+                sample = df[col].dropna().head(50)
                 converted = False
                 if len(sample) > 0:
                     numeric_count = 0
+                    non_na_str_count = 0
                     for val in sample:
                         if isinstance(val, str):
+                            non_na_str_count += 1
+                            # Remove ALL commas (handles both Indian and
+                            # Western number formats)
                             cleaned = val.replace(",", "").strip()
                             try:
                                 float(cleaned)
                                 numeric_count += 1
                             except ValueError:
                                 pass
-                    # If >70% of sampled values look numeric, convert the column
-                    if numeric_count / len(sample) > 0.7:
+                    # If >50% of string values look numeric, convert the
+                    # column (lowered threshold from 70% to catch columns
+                    # with some blanks/NaN mixed in)
+                    check_count = non_na_str_count if non_na_str_count > 0 else len(sample)
+                    if numeric_count / check_count > 0.5 and numeric_count >= 3:
                         df[col] = pd.to_numeric(
                             df[col].apply(
                                 lambda x: str(x).replace(",", "").strip()
@@ -97,6 +106,10 @@ def load_data(path: str) -> dict[str, pd.DataFrame]:
                             errors="coerce",
                         )
                         converted = True
+                        logger.info(
+                            f"  Converted '{col}' to numeric "
+                            f"({numeric_count}/{check_count} values parsed)"
+                        )
 
                 # Auto-detect date columns (only if not already converted to numeric)
                 if not converted and df[col].dtype == "object":
@@ -127,10 +140,41 @@ def load_data(path: str) -> dict[str, pd.DataFrame]:
 
 
 # ── SCHEMA EXTRACTION ────────────────────────────────────────────────────
+def _get_representative_sample(df: pd.DataFrame, n: int = 5) -> pd.DataFrame:
+    """Pick up to `n` representative rows spread across different categorical
+    values (e.g. different months, statuses, products). This gives the LLM a
+    much better picture of the data than just head(2)."""
+    # Find the best categorical column to stratify on (prefer MONTH, STATUS,
+    # PRODUCT — whichever has the most variety but is still categorical)
+    best_col = None
+    best_nunique = 0
+    priority_cols = ["MONTH", "STATUS", "STAGE", "PRODUCT", "COUNTRY"]
+
+    for col in priority_cols:
+        if col in df.columns and df[col].dtype == "object":
+            nu = df[col].nunique()
+            if 2 <= nu <= 20 and nu > best_nunique:
+                best_col = col
+                best_nunique = nu
+
+    if best_col is not None and len(df) > n:
+        # Take at least 1 row per unique value, up to n total
+        groups = df.groupby(best_col, sort=False)
+        samples = []
+        per_group = max(1, n // best_nunique)
+        for _, group_df in groups:
+            samples.append(group_df.head(per_group))
+        sample = pd.concat(samples).head(n)
+    else:
+        sample = df.head(n)
+
+    return sample
+
+
 def get_schema_prompt(dataframes: dict[str, pd.DataFrame]) -> str:
     """Build a compact schema description for the LLM — column names, types,
-    unique values for categoricals, and 2 sample rows. Typically ~500 chars
-    instead of 122,000."""
+    unique values for categoricals, and representative sample rows spread
+    across different categories. Typically ~800 chars instead of 122,000."""
     parts = []
     for sheet_name, df in dataframes.items():
         parts.append(f"=== SHEET: {sheet_name} ({len(df)} rows) ===")
@@ -153,10 +197,11 @@ def get_schema_prompt(dataframes: dict[str, pd.DataFrame]) -> str:
 
             parts.append(info)
 
-        # 2 sample rows so the LLM sees the data shape
-        parts.append("\nSAMPLE ROWS (first 2):")
-        sample = df.head(2).to_string(index=False)
-        parts.append(sample)
+        # Representative sample rows so the LLM sees the data shape
+        # (spread across different months/statuses/products)
+        sample = _get_representative_sample(df, n=5)
+        parts.append(f"\nSAMPLE ROWS ({len(sample)} representative rows):")
+        parts.append(sample.to_string(index=False))
         parts.append("")
 
     return "\n".join(parts)
@@ -632,6 +677,59 @@ GREETING_REPLY = (
 )
 
 
+# ── META-QUESTION DETECTION ──────────────────────────────────────────────
+# Handles questions like "how did you calculate", "how u got that",
+# "explain your method", "show me the formula" etc.
+META_KEYWORDS = [
+    "how did you calculate", "how u calculated", "how you calculated",
+    "how did u calculate", "how do you calculate",
+    "how u got", "how did you get", "how you got",
+    "what method", "what formula", "show formula",
+    "how is it calculated", "calculation method",
+    "verify", "is that correct", "is this correct",
+    "how u count", "how did you count", "how you count",
+    "explain the calculation", "explain calculation",
+    "show me how", "how did u get",
+]
+
+
+def _is_meta_question(text: str) -> bool:
+    """Check if the user is asking about HOW the bot calculated something."""
+    lower = text.strip().lower()
+    return any(kw in lower for kw in META_KEYWORDS)
+
+
+def _meta_answer(question: str, user_id: int) -> str:
+    """Explain how the bot works when the user asks about the calculation."""
+    # Check if we have recent conversation history to reference
+    history = user_histories.get(user_id, [])
+    last_qa = ""
+    if history:
+        last_q, last_a = history[-1]
+        last_qa = (
+            f"\n\nYour previous question was: \"{last_q}\"\n"
+            f"And I answered: \"{last_a[:200]}...\""
+        )
+
+    return (
+        "Here's how I work:\n\n"
+        "1. I look at the column names, data types, and unique values "
+        "from your Excel spreadsheet (the 'schema').\n"
+        "2. Based on your question, I generate Python pandas code to "
+        "query the full dataset (all rows).\n"
+        "3. I run that code locally against your actual Excel data and "
+        "get the raw result.\n"
+        "4. I then format that result into a readable answer.\n\n"
+        "For counting questions like 'how many completed', I use "
+        "pandas filtering — e.g. counting all rows where the STATUS "
+        "column contains the word 'COMPLETED'. This includes statuses "
+        "like 'COMPLETED' and 'COMPLETED & RUNNING'."
+        f"{last_qa}\n\n"
+        "If you want to double-check a specific number, just ask "
+        "something like 'show all completed batches' and I'll list them!"
+    )
+
+
 # ── INSIGHT MODE (for why/explain/analyze questions) ─────────────────────
 INSIGHT_KEYWORDS = [
     "why", "explain", "reason", "analyze", "analyse", "insight",
@@ -723,6 +821,10 @@ def ask_llm(question: str, user_id: int) -> str:
     if _is_greeting(question):
         return GREETING_REPLY
 
+    # 0.5. Handle meta-questions about calculation method (zero API cost)
+    if _is_meta_question(question):
+        return _meta_answer(question, user_id)
+
     # 1. Check cache
     cached = cache.get(question)
     if cached:
@@ -808,16 +910,19 @@ def ask_llm(question: str, user_id: int) -> str:
 
 
 def _fallback_answer(question: str, user_id: int) -> str:
-    """Last resort: send first 30 rows as text to Gemini (still much less
-    than the original 122K chars approach)."""
-    logger.info("Using fallback: small data subset")
+    """Last resort: send representative rows as text to the LLM (still much
+    less than the original 122K chars approach)."""
+    logger.info("Using fallback: representative data subset")
     main_sheet = list(DATAFRAMES.keys())[0]
-    subset = DATAFRAMES[main_sheet].head(30).to_string(index=False)
+    df = DATAFRAMES[main_sheet]
+    # Use representative sampling instead of head(30) to cover all
+    # months/statuses/products
+    subset = _get_representative_sample(df, n=30).to_string(index=False)
 
     fallback_prompt = (
         f"You are a helpful data assistant. Answer the question using ONLY "
         f"this data. If you can't answer fully, say so.\n\n"
-        f"DATA (first 30 rows of {len(DATAFRAMES[main_sheet])} total):\n"
+        f"DATA (representative 30 rows of {len(df)} total):\n"
         f"{subset}\n\n"
         f"QUESTION: {question}\n\n"
         f"ANSWER (plain text, no markdown):"
